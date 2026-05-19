@@ -1,0 +1,13 @@
+{
+  "repo": "molecular-property-prediction-gnn",
+  "title": "Molecular Property Prediction with Graph Neural Networks",
+  "category": "AI-ML-Projects",
+  "description": "A graph neural network project for predicting molecular HOMO-LUMO gap values using QM9-style molecular graph data.",
+  "topics": [
+    "gnn",
+    "molecular-property-prediction",
+    "pytorch",
+    "chemistry",
+    "qm9"
+  ]
+}

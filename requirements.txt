@@ -1,0 +1,7 @@
+torch==2.7.0+cpu
+torchvision==0.22.0+cpu
+torchaudio==2.7.0+cpu
+torch_geometric==2.6.1
+rdkit-pypi==2022.9.5
+numpy==1.26.4
+
