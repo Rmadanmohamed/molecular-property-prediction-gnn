@@ -6,6 +6,7 @@ on the QM9 dataset using PyTorch Geometric.
 
 import os
 import time
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,12 +20,12 @@ from torch_geometric.nn import GCNConv, NNConv
 # --- Configuration ---
 TARGET_PROPERTY_INDEX = 4  # Index for HOMO-LUMO gap (Δε) in QM9
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-DATA_PATH = os.path.join(os.getcwd(), 'data', 'QM9') # Directory to store the dataset
-MODEL_SAVE_PATH = '/home/ubuntu/gnn_qm9_homo_lumo.pt'
+DATA_PATH = Path(os.environ.get('QM9_DATA_DIR', Path(__file__).resolve().parent / 'data' / 'QM9'))
+MODEL_SAVE_PATH = Path(os.environ.get('QM9_OUTPUT_PATH', Path(__file__).resolve().parent / 'runs' / 'gnn_qm9_homo_lumo.pt'))
 NUM_EPOCHS = 30 # Reduced from SchNet model due to simpler architecture
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
-NUM_WORKERS = 4 # For DataLoader
+NUM_WORKERS = int(os.environ.get('QM9_NUM_WORKERS', '0')) # portable default
 
 # --- Model Definition ---
 class EdgeNetwork(nn.Module):
@@ -38,11 +39,11 @@ class EdgeNetwork(nn.Module):
         )
         
     def forward(self, x):
-        return self.nn(x).view(-1, self.nn[-1].out_features // self.nn[-1].out_features, self.nn[-1].out_features)
+        return self.nn(x)
 
 class GNNModel(torch.nn.Module):
     """Custom GNN model for molecular property prediction."""
-    def __init__(self, node_features=11, edge_features=4, hidden_channels=64, out_channels=1):
+    def __init__(self, node_features=8, edge_features=4, hidden_channels=64, out_channels=1):
         super(GNNModel, self).__init__()
         
         # Initial node embedding
@@ -76,7 +77,7 @@ class GNNModel(torch.nn.Module):
         x = self.node_embedding(x)
         x = F.relu(x)
         
-        # Graph convolution layers with residual connections
+        # Graph convolution layers (no residual connections in the original architecture)
         x1 = F.relu(self.conv1(x, edge_index, edge_attr))
         x2 = F.relu(self.conv2(x1, edge_index, edge_attr))
         x3 = F.relu(self.conv3(x2, edge_index, edge_attr))
@@ -91,65 +92,71 @@ class GNNModel(torch.nn.Module):
         return x
 
 # --- Data Loading and Preprocessing ---
+class CustomTransform:
+    def __init__(self, target_index):
+        self.target_index = target_index
+        
+    def __call__(self, data):
+        # Select the target property
+        data.y = data.y[:, self.target_index].unsqueeze(1)
+        
+        # Create node features (atomic number one-hot encoded)
+        # QM9 uses z for atomic numbers
+        z = data.z.long()
+        
+        # Create a simple one-hot encoding for atom types (H, C, N, O, F)
+        # Atomic numbers: H=1, C=6, N=7, O=8, F=9
+        atom_types = torch.zeros(z.size(0), 5, dtype=torch.float)
+        for i, atom in enumerate(z):
+            if atom == 1:  # H
+                atom_types[i, 0] = 1
+            elif atom == 6:  # C
+                atom_types[i, 1] = 1
+            elif atom == 7:  # N
+                atom_types[i, 2] = 1
+            elif atom == 8:  # O
+                atom_types[i, 3] = 1
+            elif atom == 9:  # F
+                atom_types[i, 4] = 1
+        
+        # Add additional node features (position)
+        # Normalize positions to have zero mean and unit variance
+        pos = data.pos
+        pos_mean = pos.mean(dim=0)
+        pos_std = pos.std(dim=0, unbiased=False)
+        pos_normalized = (pos - pos_mean) / (pos_std + 1e-6)
+        
+        # Combine atom types and positions as node features
+        data.x = torch.cat([atom_types, pos_normalized], dim=1)
+        
+        # Create edge features based on distances between atoms
+        row, col = data.edge_index
+        dist = torch.norm(data.pos[row] - data.pos[col], p=2, dim=1).view(-1, 1)
+        
+        # Create Gaussian basis for distances
+        # Use 3 Gaussian functions centered at different distances
+        centers = torch.tensor([0.0, 1.5, 3.0]).to(dist.device)
+        width = 0.5
+        gaussian_basis = torch.exp(-width * (dist.view(-1, 1) - centers.view(1, -1))**2)
+        
+        # Add distance as an additional feature
+        data.edge_attr = torch.cat([dist, gaussian_basis], dim=1)
+        
+        return data
+
+
 def main():
+    if MODEL_SAVE_PATH.exists():
+        raise FileExistsError('Choose a new QM9_OUTPUT_PATH; existing checkpoints are protected')
+    MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(42)
     print(f"Using device: {DEVICE}")
     print("Loading QM9 dataset...")
     
-    # Define a transform to prepare the data for our model
-    class CustomTransform:
-        def __init__(self, target_index):
-            self.target_index = target_index
-            
-        def __call__(self, data):
-            # Select the target property
-            data.y = data.y[:, self.target_index].unsqueeze(1)
-            
-            # Create node features (atomic number one-hot encoded)
-            # QM9 uses z for atomic numbers
-            z = data.z.long()
-            
-            # Create a simple one-hot encoding for atom types (H, C, N, O, F)
-            # Atomic numbers: H=1, C=6, N=7, O=8, F=9
-            atom_types = torch.zeros(z.size(0), 5, dtype=torch.float)
-            for i, atom in enumerate(z):
-                if atom == 1:  # H
-                    atom_types[i, 0] = 1
-                elif atom == 6:  # C
-                    atom_types[i, 1] = 1
-                elif atom == 7:  # N
-                    atom_types[i, 2] = 1
-                elif atom == 8:  # O
-                    atom_types[i, 3] = 1
-                elif atom == 9:  # F
-                    atom_types[i, 4] = 1
-            
-            # Add additional node features (position)
-            # Normalize positions to have zero mean and unit variance
-            pos = data.pos
-            pos_mean = pos.mean(dim=0)
-            pos_std = pos.std(dim=0)
-            pos_normalized = (pos - pos_mean) / (pos_std + 1e-6)
-            
-            # Combine atom types and positions as node features
-            data.x = torch.cat([atom_types, pos_normalized], dim=1)
-            
-            # Create edge features based on distances between atoms
-            row, col = data.edge_index
-            dist = torch.norm(data.pos[row] - data.pos[col], p=2, dim=1).view(-1, 1)
-            
-            # Create Gaussian basis for distances
-            # Use 3 Gaussian functions centered at different distances
-            centers = torch.tensor([0.0, 1.5, 3.0]).to(dist.device)
-            width = 0.5
-            gaussian_basis = torch.exp(-width * (dist.view(-1, 1) - centers.view(1, -1))**2)
-            
-            # Add distance as an additional feature
-            data.edge_attr = torch.cat([dist, gaussian_basis], dim=1)
-            
-            return data
-    
     # Load the dataset
-    dataset = QM9(DATA_PATH, transform=CustomTransform(TARGET_PROPERTY_INDEX))
+    dataset = QM9(str(DATA_PATH), transform=CustomTransform(TARGET_PROPERTY_INDEX))
+    if len(dataset) <= 120000:
+        raise ValueError('Original QM9 dataset is required for the intended split')
     
     print(f"Dataset loaded. Number of graphs: {len(dataset)}")
     
@@ -251,7 +258,7 @@ def main():
     
     # --- Final Evaluation ---
     print("Loading best model for final evaluation...")
-    model.load_state_dict(torch.load(MODEL_SAVE_PATH))
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE, weights_only=True))
     test_mae = evaluate(test_loader)
     print(f"Final Test MAE: {test_mae:.4f}")
 
