@@ -123,7 +123,7 @@ class CustomTransform:
         # Normalize positions to have zero mean and unit variance
         pos = data.pos
         pos_mean = pos.mean(dim=0)
-        pos_std = pos.std(dim=0, unbiased=False)
+        pos_std = pos.std(dim=0, unbiased=pos.size(0) > 1)
         pos_normalized = (pos - pos_mean) / (pos_std + 1e-6)
         
         # Combine atom types and positions as node features
